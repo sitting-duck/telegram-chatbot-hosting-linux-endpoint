@@ -8,7 +8,20 @@ python3.11 -m venv .venv
 source .venv/bin/activate
 pip install --upgrade pip
 pip install "numpy<2"
+sudo apt install -y python3-venv python3-pip git curl jq ffmpeg openssl
 pip install -r requirements.txt
+```
+
+### Build BM25 Index
+```bash
+python build_bm25.py --corpus ./corpus_clean.jsonl --out ./bm25.idx
+```
+
+### Register webhook
+```bash
+source scripts/load_env.sh # mandatory
+scripts/register_webhook.sh
+
 ```
 
 Install NGrok (source: https://dashboard.ngrok.com/get-started/setup/linux)
@@ -84,5 +97,14 @@ Fri Nov 14 13:58:21 2025
 |    0   N/A  N/A           13572      G   .../7177/usr/lib/firefox/firefox        156MiB |
 |    0   N/A  N/A          392241      G   .../teamviewer/tv_bin/TeamViewer         13MiB |
 +-----------------------------------------------------------------------------------------+
+
+```
+
+### Ollama setup
+```bash
+scripts/run_ollama.sh
+# check if ollama is running by navigating to 
+# http://localhost:11434/
+# in your browser
 
 ```
