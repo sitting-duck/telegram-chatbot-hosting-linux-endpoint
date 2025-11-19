@@ -1,9 +1,10 @@
-# main.py — Telegram + RAG + analytics + web Rex hook
+# main.py — Telegram + RAG + reranker + analytics + web Rex hook
 
-import os, json, logging
+import os, sys, json, logging
 from time import monotonic
 from contextlib import asynccontextmanager
 from pathlib import Path
+from typing import Any, Dict, List
 
 import httpx
 from fastapi import FastAPI, Request, HTTPException
@@ -20,7 +21,17 @@ from analytics_logger import (
     categorize,
 )
 from retriever_bm25 import load_survival_index, retrieve as bm25_retrieve
-from web_rex import register_web_routes  # NEW
+from web_rex import register_web_routes
+
+# --- Wire up training repo so we can import reranker_ce ---
+TRAIN_REPO = os.environ.get("TRAIN_REPO")
+if TRAIN_REPO and TRAIN_REPO not in sys.path:
+    sys.path.append(TRAIN_REPO)
+
+try:
+    from reranker_ce import RerankerCE
+except Exception:
+    RerankerCE = None  # type: ignore
 
 logging.basicConfig(level=logging.INFO)
 
@@ -43,6 +54,26 @@ SUBSCRIBERS_FILE = Path(os.environ.get("SUBSCRIBERS_FILE", "subscribers.json"))
 # RAG knobs
 MIN_BM25_SCORE   = float(os.environ.get("MIN_BM25_SCORE", "2.0"))
 MAX_CONTEXT_DOCS = int(os.environ.get("MAX_CONTEXT_DOCS", "5"))
+BM25_TOPK        = int(os.environ.get("BM25_TOPK", "50"))
+RERANK_TOPN      = int(os.environ.get("RERANK_TOPN", "3"))
+
+# Reranker checkpoint (from your training repo)
+RERANKER_PATH = os.environ.get("RERANKER_PATH")
+RERANKER_MODEL = None
+
+if RERANKER_PATH and RerankerCE is not None:
+    try:
+        logging.info(f"Loading reranker from {RERANKER_PATH} ...")
+        RERANKER_MODEL = RerankerCE(RERANKER_PATH)
+        logging.info("Reranker loaded OK.")
+    except Exception:
+        logging.exception("Failed to load reranker; continuing without it.")
+        RERANKER_MODEL = None
+else:
+    if not RERANKER_PATH:
+        logging.info("No RERANKER_PATH set; running without reranker.")
+    if RerankerCE is None:
+        logging.info("reranker_ce import failed; running without reranker.")
 
 # --- Load Survival-Data BM25 index at startup ---
 try:
@@ -51,6 +82,47 @@ try:
 except Exception:
     logging.exception("Rex: failed to load Survival-Data BM25 index")
     BM25, DOCS = None, []
+
+# --- Helper: cross-encoder rerank wrapper ---
+def rerank_candidates(query: str, candidates: List[Dict[str, Any]], top_k: int) -> List[Dict[str, Any]]:
+    """
+    Take BM25 candidates (each with 'text', 'score', etc.), use RERANKER_MODEL
+    to get better ordering, and return top_k docs.
+    """
+    global RERANKER_MODEL
+    if RERANKER_MODEL is None:
+        return candidates[:top_k]
+
+    # Prepare pairs (query, passage)
+    passages = [c.get("text") or "" for c in candidates]
+    pairs = [(query, p) for p in passages]
+
+    try:
+        # Try RERANKER_MODEL.predict first, else fall back to underlying .model.predict
+        if hasattr(RERANKER_MODEL, "predict"):
+            scores = RERANKER_MODEL.predict(pairs)  # type: ignore[arg-type]
+        elif hasattr(RERANKER_MODEL, "model") and hasattr(RERANKER_MODEL.model, "predict"):
+            scores = RERANKER_MODEL.model.predict(pairs)  # type: ignore[union-attr]
+        else:
+            logging.warning("RERANKER_MODEL has no predict or model.predict; skipping rerank.")
+            return candidates[:top_k]
+    except Exception:
+        logging.exception("Error while reranking candidates; falling back to BM25 order.")
+        return candidates[:top_k]
+
+    # Attach scores and sort
+    scored: List[Dict[str, Any]] = []
+    for cand, s in zip(candidates, scores):
+        c = dict(cand)
+        try:
+            c["rerank_score"] = float(s)
+        except Exception:
+            c["rerank_score"] = 0.0
+        scored.append(c)
+
+    scored.sort(key=lambda d: d.get("rerank_score", 0.0), reverse=True)
+    return scored[:top_k]
+
 
 # --- Build PTB app ---
 tg_app = Application.builder().token(BOT_TOKEN).build()
@@ -335,7 +407,7 @@ async def norag_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             meta={"model": OLLAMA_MODEL, "mode": "norag", "exception": str(e)},
         )
 
-# --- Text handler (Rex + RAG) ---
+# --- Text handler (Rex + RAG + optional reranker) ---
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_text = update.message.text
     chat_id = update.effective_chat.id
@@ -351,15 +423,24 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         if BM25 is not None and DOCS:
-            results = bm25_retrieve(user_text, BM25, DOCS, top_k=8)
-            best_score = results[0]["score"] if results else 0.0
+            # 1) BM25 retrieve
+            candidates = bm25_retrieve(user_text, BM25, DOCS, top_k=BM25_TOPK)
+            best_score = candidates[0]["score"] if candidates else 0.0
 
-            context_chunks = []
-            if results and best_score >= MIN_BM25_SCORE:
-                for hit in results[:MAX_CONTEXT_DOCS]:
-                    title = hit.get("title") or ""
-                    prefix = f"[{title}] " if title else ""
-                    context_chunks.append(prefix + hit["text"])
+            context_docs: List[Dict[str, Any]] = []
+            if candidates and best_score >= MIN_BM25_SCORE:
+                # 2) optional rerank
+                if RERANKER_MODEL is not None:
+                    ranked = rerank_candidates(user_text, candidates, top_k=max(MAX_CONTEXT_DOCS, RERANK_TOPN))
+                else:
+                    ranked = candidates
+                context_docs = ranked[:MAX_CONTEXT_DOCS]
+
+            context_chunks: List[str] = []
+            for hit in context_docs:
+                title = hit.get("title") or ""
+                prefix = f"[{title}] " if title else ""
+                context_chunks.append(prefix + (hit.get("text") or ""))
             context_block = "\n\n".join(context_chunks)
 
             survival_sys_prompt = (
@@ -397,7 +478,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     context, chat_id, msg.message_id, buffer, last_edit, last_text
                 )
 
-            mode = "rag"
+            mode = "rag_rerank" if RERANKER_MODEL is not None else "rag"
 
         else:
             concise_sys_prompt = (
@@ -499,6 +580,9 @@ register_web_routes(
         "MAX_CONTEXT_DOCS": MAX_CONTEXT_DOCS,
         "categorize": categorize,
         "log_interaction": log_interaction,
+        "BM25_TOPK": BM25_TOPK,
+        "RERANK_TOPN": RERANK_TOPN,
+        "rerank_candidates": rerank_candidates if RERANKER_MODEL is not None else None,
     },
 )
 

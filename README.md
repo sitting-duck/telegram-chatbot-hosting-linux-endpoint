@@ -12,6 +12,11 @@ sudo apt install -y python3-venv python3-pip git curl jq ffmpeg openssl
 pip install -r requirements.txt
 ```
 
+### Create your .env file
+```bash
+cp .env.tmp .env
+```
+
 ### Build BM25 Index
 ```bash
 python build_bm25.py --corpus ./corpus_clean.jsonl --out ./bm25.idx
