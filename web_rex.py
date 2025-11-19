@@ -1,4 +1,4 @@
-# web_rex.py — Web UI + JSON API for Rex (2-column compare view + example prompts)
+# web_rex.py — Web UI + JSON API for Rex (2-column compare view + example prompts + RAG sources)
 
 from time import monotonic
 
@@ -181,6 +181,42 @@ REX_HTML = """
       color: #8088aa;
       margin-top: 4px;
     }
+    .sources-header {
+      margin-top: 8px;
+      font-size: 0.8rem;
+      font-weight: 600;
+      color: #c3ccff;
+    }
+    .sources {
+      margin-top: 4px;
+      font-size: 0.78rem;
+      color: #b5bddf;
+      max-height: 180px;
+      overflow-y: auto;
+      padding-right: 4px;
+    }
+    .source-item {
+      border-radius: 6px;
+      padding: 4px 6px;
+      margin-bottom: 4px;
+      background: #090e1a;
+      border: 1px solid #252b45;
+    }
+    .source-title {
+      font-weight: 600;
+      font-size: 0.8rem;
+      margin-bottom: 2px;
+    }
+    .source-meta {
+      font-size: 0.7rem;
+      color: #8d95bd;
+      margin-bottom: 2px;
+      word-break: break-all;
+    }
+    .source-snippet {
+      font-size: 0.78rem;
+      color: #bec6f0;
+    }
     @media (max-width: 720px) {
       .card {
         padding: 16px;
@@ -225,6 +261,8 @@ REX_HTML = """
         <div class="status" id="status-rag"></div>
         <div class="answer" id="answer-rag"></div>
         <div class="meta" id="meta-rag"></div>
+        <div class="sources-header">Sources (RAG context)</div>
+        <div class="sources" id="sources-rag"></div>
       </div>
 
       <div class="col">
@@ -250,15 +288,40 @@ REX_HTML = """
     const answerNoragEl  = document.getElementById('answer-norag');
     const metaRagEl      = document.getElementById('meta-rag');
     const metaNoragEl    = document.getElementById('meta-norag');
+    const sourcesRagEl   = document.getElementById('sources-rag');
 
     const exampleButtons = document.querySelectorAll('.example-btn');
 
-    // Example prompt text — you can tweak these to match your "bad answer" test cases if you want.
     const EXAMPLES = {
       knife: "What kind of knife should I carry for hiking in the bush?",
       water: "How much water should I store for a family of 3 for a 7-day emergency?",
       wound: "How should I treat a deep cut if I am far from medical help?"
     };
+
+    function renderRagSources(list) {
+      if (!Array.isArray(list) || list.length === 0) {
+        sourcesRagEl.textContent = "No specific library passages were surfaced.";
+        return;
+      }
+      let html = "";
+      list.forEach((s, idx) => {
+        const title = s.title || "(no title)";
+        const id = s.id || "";
+        const src = s.source_path || "";
+        const snippet = s.snippet || "";
+        const score = (typeof s.score === "number") ? s.score.toFixed(3) : "";
+        html += `
+          <div class="source-item">
+            <div class="source-title">#${idx + 1} ${title}</div>
+            <div class="source-meta">
+              ${score ? "score=" + score + " • " : ""}${id}${src ? " • " + src : ""}
+            </div>
+            <div class="source-snippet">${snippet}</div>
+          </div>
+        `;
+      });
+      sourcesRagEl.innerHTML = html;
+    }
 
     async function callMode(mode) {
       const q = questionEl.value.trim();
@@ -274,6 +337,10 @@ REX_HTML = """
       statusEl.textContent = 'Thinking…';
       answerEl.textContent = '';
       metaEl.textContent   = '';
+
+      if (isRag) {
+        sourcesRagEl.textContent = '';
+      }
 
       const res = await fetch('/api/rex', {
         method: 'POST',
@@ -292,6 +359,10 @@ REX_HTML = """
       const ms = data.elapsed_ms ?? 0;
       metaEl.textContent = `Mode: ${modeLabel} • Time: ${ms} ms`;
       statusEl.textContent = '';
+
+      if (isRag) {
+        renderRagSources(data.sources || []);
+      }
     }
 
     async function compare() {
@@ -309,6 +380,7 @@ REX_HTML = """
       answerNoragEl.textContent = '';
       metaRagEl.textContent     = '';
       metaNoragEl.textContent   = '';
+      sourcesRagEl.textContent  = '';
 
       try {
         await Promise.all([
@@ -327,7 +399,6 @@ REX_HTML = """
       compare();
     });
 
-    // Ctrl+Enter / Cmd+Enter to compare quickly
     questionEl.addEventListener('keydown', (e) => {
       if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) {
         e.preventDefault();
@@ -335,7 +406,6 @@ REX_HTML = """
       }
     });
 
-    // Example buttons: set prompt and auto-compare
     exampleButtons.forEach(btn => {
       btn.addEventListener('click', () => {
         const key = btn.dataset.example;
@@ -382,7 +452,7 @@ def register_web_routes(app, ctx):
         """
         Shared generator for the /api/rex endpoint.
         mode: "rag" (default) or "norag"
-        Returns dict with answer, mode_used, elapsed_ms.
+        Returns dict with answer, mode_used, elapsed_ms, sources.
         """
         user_text_stripped = (user_text or "").strip()
         if not user_text_stripped:
@@ -390,6 +460,7 @@ def register_web_routes(app, ctx):
 
         start_ts = monotonic()
         buffer = ""
+        sources = []
 
         try:
             if mode == "norag":
@@ -401,7 +472,7 @@ def register_web_routes(app, ctx):
                 async for chunk in stream_ollama(user_text_stripped, sys_prompt=concise_sys_prompt):
                     buffer += chunk
                     if len(buffer) >= MAX_TOTAL_CHARS:
-                        buffer = buffer[:MAX_TOTAL_CHARS] + "\n\n…(truncated for length)"
+                        buffer = buffer[:MAX_TOTAL_CHARS] + "\\n\\n…(truncated for length)"
                         break
                 mode_used = "norag"
             else:
@@ -415,7 +486,18 @@ def register_web_routes(app, ctx):
                             title = hit.get("title") or ""
                             prefix = f"[{title}] " if title else ""
                             context_chunks.append(prefix + hit["text"])
-                    context_block = "\n\n".join(context_chunks)
+
+                            text = (hit.get("text") or "").replace("\\n", " ").replace("\\r", " ")
+                            snippet = text[:280] + ("…" if len(text) > 280 else "")
+
+                            sources.append({
+                                "title": title,
+                                "id": hit.get("id"),
+                                "source_path": hit.get("source_path"),
+                                "score": float(hit.get("score", 0.0)),
+                                "snippet": snippet,
+                            })
+                    context_block = "\\n\\n".join(context_chunks)
 
                     survival_sys_prompt = (
                         "You are Rex, an experienced survival and preparedness instructor talking to a beginner. "
@@ -427,16 +509,16 @@ def register_web_routes(app, ctx):
 
                     if context_block:
                         model_user_prompt = (
-                            f"User question:\n{user_text_stripped}\n\n"
+                            f"User question:\\n{user_text_stripped}\\n\\n"
                             "Here are relevant excerpts from a survival knowledge base. "
-                            "Use them when they clearly help answer the question:\n\n"
-                            f"{context_block}\n\n"
+                            "Use them when they clearly help answer the question:\\n\\n"
+                            f"{context_block}\\n\\n"
                             "Now answer the question above as Rex, using the excerpts plus your own survival expertise. "
                             "Do NOT mention 'documents' or 'context'; just answer normally."
                         )
                     else:
                         model_user_prompt = (
-                            f"The user asked:\n{user_text_stripped}\n\n"
+                            f"The user asked:\\n{user_text_stripped}\\n\\n"
                             "Answer as Rex the survival instructor using your general survival knowledge. "
                             "If something is uncertain or risky, explain the tradeoffs and safety precautions."
                         )
@@ -444,7 +526,7 @@ def register_web_routes(app, ctx):
                     async for chunk in stream_ollama(model_user_prompt, sys_prompt=survival_sys_prompt):
                         buffer += chunk
                         if len(buffer) >= MAX_TOTAL_CHARS:
-                            buffer = buffer[:MAX_TOTAL_CHARS] + "\n\n…(truncated for length)"
+                            buffer = buffer[:MAX_TOTAL_CHARS] + "\\n\\n…(truncated for length)"
                             break
 
                     mode_used = "rag"
@@ -457,7 +539,7 @@ def register_web_routes(app, ctx):
                     async for chunk in stream_ollama(user_text_stripped, sys_prompt=concise_sys_prompt):
                         buffer += chunk
                         if len(buffer) >= MAX_TOTAL_CHARS:
-                            buffer = buffer[:MAX_TOTAL_CHARS] + "\n\n…(truncated for length)"
+                            buffer = buffer[:MAX_TOTAL_CHARS] + "\\n\\n…(truncated for length)"
                             break
                     mode_used = "fallback"
 
@@ -476,7 +558,12 @@ def register_web_routes(app, ctx):
             except Exception:
                 pass
 
-            return {"answer": buffer or "No response.", "mode": mode_used, "elapsed_ms": elapsed_ms}
+            return {
+                "answer": buffer or "No response.",
+                "mode": mode_used,
+                "elapsed_ms": elapsed_ms,
+                "sources": sources if mode_used == "rag" else [],
+            }
 
         except Exception as e:
             elapsed_ms = int((monotonic() - start_ts) * 1000)
@@ -514,7 +601,6 @@ def register_web_routes(app, ctx):
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Internal error: {e}")
 
-    # Register routes on the given app
     app.add_api_route("/", rex_page, methods=["GET"])
     app.add_api_route("/api/rex", api_rex, methods=["POST"])
 

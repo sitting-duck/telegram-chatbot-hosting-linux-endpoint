@@ -1,9 +1,10 @@
-# main.py — Telegram + RAG + analytics + web Rex hook
+# main.py — Telegram + RAG + CrossEncoder reranker + analytics + web Rex hook
 
-import os, json, logging
+import os, sys, json, logging
 from time import monotonic
 from contextlib import asynccontextmanager
 from pathlib import Path
+from typing import List, Dict, Any
 
 import httpx
 from fastapi import FastAPI, Request, HTTPException
@@ -21,6 +22,7 @@ from analytics_logger import (
 )
 from retriever_bm25 import load_survival_index, retrieve as bm25_retrieve
 from web_rex import register_web_routes  # NEW
+from sentence_transformers import CrossEncoder  # NEW: use CrossEncoder directly
 
 logging.basicConfig(level=logging.INFO)
 
@@ -43,6 +45,11 @@ SUBSCRIBERS_FILE = Path(os.environ.get("SUBSCRIBERS_FILE", "subscribers.json"))
 # RAG knobs
 MIN_BM25_SCORE   = float(os.environ.get("MIN_BM25_SCORE", "2.0"))
 MAX_CONTEXT_DOCS = int(os.environ.get("MAX_CONTEXT_DOCS", "5"))
+BM25_TOPK        = int(os.environ.get("BM25_TOPK", "50"))
+RERANK_TOPN      = int(os.environ.get("RERANK_TOPN", "5"))
+
+# Reranker checkpoint
+RERANKER_PATH = os.environ.get("RERANKER_PATH", "").rstrip("/")
 
 # --- Load Survival-Data BM25 index at startup ---
 try:
@@ -51,6 +58,44 @@ try:
 except Exception:
     logging.exception("Rex: failed to load Survival-Data BM25 index")
     BM25, DOCS = None, []
+
+# --- Load CrossEncoder reranker (optional) ---
+RERANKER_MODEL: CrossEncoder | None = None
+if RERANKER_PATH:
+    try:
+        logging.info(f"Rex: loading CrossEncoder reranker from {RERANKER_PATH} ...")
+        RERANKER_MODEL = CrossEncoder(RERANKER_PATH, num_labels=1, max_length=256)
+        logging.info("Rex: CrossEncoder reranker loaded successfully.")
+    except Exception:
+        logging.exception("Rex: failed to load CrossEncoder reranker; continuing with BM25 only.")
+else:
+    logging.info("Rex: RERANKER_PATH not set; using BM25 only.")
+
+def rerank_candidates(
+    query: str,
+    candidates: List[Dict[str, Any]],
+    top_k: int,
+) -> List[Dict[str, Any]]:
+    """
+    Use CrossEncoder to rerank BM25 candidates.
+    - Keeps original BM25 score in 'bm25_score'
+    - Stores CrossEncoder score in 'ce_score'
+    - Sorts by ce_score desc and returns top_k
+    """
+    if not RERANKER_MODEL or not candidates:
+        return candidates[:top_k]
+
+    texts = [(query, c.get("text", "")) for c in candidates]
+    scores = RERANKER_MODEL.predict(texts)
+    combined = []
+    for cand, s in zip(candidates, scores):
+        out = dict(cand)  # shallow copy
+        out["bm25_score"] = float(cand.get("score", 0.0))
+        out["ce_score"] = float(s)
+        combined.append(out)
+
+    combined.sort(key=lambda x: x["ce_score"], reverse=True)
+    return combined[:top_k]
 
 # --- Build PTB app ---
 tg_app = Application.builder().token(BOT_TOKEN).build()
@@ -335,7 +380,7 @@ async def norag_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             meta={"model": OLLAMA_MODEL, "mode": "norag", "exception": str(e)},
         )
 
-# --- Text handler (Rex + RAG) ---
+# --- Text handler (Rex + RAG + CrossEncoder reranker) ---
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_text = update.message.text
     chat_id = update.effective_chat.id
@@ -350,10 +395,22 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     start_ts = monotonic()
 
     try:
+        mode = "fallback"
         if BM25 is not None and DOCS:
-            results = bm25_retrieve(user_text, BM25, DOCS, top_k=8)
-            best_score = results[0]["score"] if results else 0.0
+            # 1) BM25 retrieve
+            bm25_results = bm25_retrieve(user_text, BM25, DOCS, top_k=BM25_TOPK)
+            best_score = bm25_results[0]["score"] if bm25_results else 0.0
 
+            # 2) Optional reranker if strong enough BM25 hit
+            if RERANKER_MODEL is not None and bm25_results and best_score >= MIN_BM25_SCORE:
+                candidates = bm25_results[:BM25_TOPK]
+                results = rerank_candidates(user_text, candidates, RERANK_TOPN)
+                mode = "rag_rerank"
+            else:
+                results = bm25_results
+                mode = "rag_bm25"
+
+            # 3) Build context from chosen results
             context_chunks = []
             if results and best_score >= MIN_BM25_SCORE:
                 for hit in results[:MAX_CONTEXT_DOCS]:
@@ -397,9 +454,8 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     context, chat_id, msg.message_id, buffer, last_edit, last_text
                 )
 
-            mode = "rag"
-
         else:
+            # No BM25 index; plain concise helper
             concise_sys_prompt = (
                 "You are a helpful, concise assistant replying for a Telegram bot. "
                 "Keep answers under ~180 words (≈900 characters) unless the user asks for details. "
@@ -443,7 +499,8 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logging.exception("Streaming error")
         try:
             await context.bot.edit_message_text(chat_id=chat_id, message_id=msg.message_id, text=f"Model error: {e}")
-        except BadRequest:
+        except BadRequest as e2:
+            logging.warning(f"Failed to edit error message: {e2}")
             await context.bot.send_message(chat_id=chat_id, text=f"Model error: {e}")
 
         elapsed_ms = int((monotonic() - start_ts) * 1000)
@@ -499,6 +556,7 @@ register_web_routes(
         "MAX_CONTEXT_DOCS": MAX_CONTEXT_DOCS,
         "categorize": categorize,
         "log_interaction": log_interaction,
+        # If you want: you could also pass RERANKER_MODEL & rerank_candidates into the web UI later.
     },
 )
 

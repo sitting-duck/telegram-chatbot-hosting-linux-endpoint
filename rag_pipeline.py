@@ -10,7 +10,8 @@ from sentence_transformers import CrossEncoder
 
 # --- config from env ---
 BM25_INDEX_PATH = Path(os.getenv("BM25_INDEX_PATH", "data/bm25.idx"))
-RERANKER_PATH = Path(os.getenv("RERANKER_PATH", "reranker/checkpoints/modelA_miniLM_e2_bm25neg"))
+#RERANKER_PATH = Path(os.getenv("RERANKER_PATH", "reranker/checkpoints/modelA_miniLM_e2_bm25neg"))
+RERANKER_PATH = Path(os.getenv("RERANKER_PATH", "/home/nerp/Documents/Github/apocalypse-mommy-llm-supervised-trainer/runs/bge_reranker_e2_bm25neg"))
 BM25_TOPK = int(os.getenv("BM25_TOPK", "50"))
 RERANK_TOPN = int(os.getenv("RERANK_TOPN", "3"))
 
@@ -40,6 +41,7 @@ def _ensure_loaded():
         if not RERANKER_PATH.exists():
             raise FileNotFoundError(f"Reranker checkpoint not found at {RERANKER_PATH}")
         _reranker = CrossEncoder(str(RERANKER_PATH), num_labels=1, max_length=256)
+        print(f"CrossEncoder loaded Checkpoint at: {RERANKER_PATH}")
 
 
 def _simple_tokenize(text: str) -> List[str]:
