@@ -75,7 +75,3 @@ async def telegram_webhook(request: Request):
     return {"ok": True}
 
 
-# --- Affiliate helpers (if you still want this here) ---
-def _fmt_aff_line(item) -> str:
-    return f"• {item.title}\n  {item.url}"
-

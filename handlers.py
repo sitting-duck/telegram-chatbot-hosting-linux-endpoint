@@ -187,6 +187,9 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             meta={"model": OLLAMA_MODEL, "mode": "rag", "exception": str(e)},
         )
 
+def _fmt_aff_line(item) -> str:
+    return f"• {item.title}\n  {item.url}"
+
 
 async def maybe_suggest_affiliates(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_msg = (update.message.text or "").lower()
