@@ -1,5 +1,13 @@
 # telegram-chatbot-hosting-linux-endpoint
 
+## Demos
+Chat with REX the Apocalypse Bot [Demo Website](https://river-uncomplying-unidealistically.ngrok-free.dev/) 
+This demo website will show Rex the Apocalypse Advice chat bot with and without a RAG pipeline augmentation. You can see that the off the shelf Ollama model (No RAG) is more conversational but the RAG auugmented model has much more in depth conversations about surviival due to the added corpus content. RAG model however is too eager to data dump possibly irrelevant things at the moment and so also fails at making small talk as well as the off the shelf Ollama model. 
+
+[Google Colab Demo](https://colab.research.google.com/drive/1PFrWpD_Y79dNfxiq0EPlwh3MTvC1_HpI?usp=sharing) : A very light weight bare bones implementation of the training code in a notebook like environment. A checkpoint will be generated and downloaded to your Downloads folder and a chat interface will load in the final cell, but keep in mind that this demo is to show in an academic way the training pipeline structure and that the actual checkpoint is so lightweight and the dataset so small that this chat bot will be barely conversational. The leanest possible model. 
+
+[Telegram Chatbot](https://t.me/rex_apocalypse_bot) : Chat with Rex the Apocalypse Bot here on Telegram.
+
 Always on Linux the first thing we do is: 
 ```bash
 sudo apt update
